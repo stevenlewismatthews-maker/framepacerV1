@@ -1,0 +1,28 @@
+name: Build FramePacer
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up 32-bit MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build FramePacer.asi
+        shell: cmd
+        run: cl /nologo /LD /O2 /MT /EHsc /Fe:FramePacer.asi FramePacer.cpp winmm.lib
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FramePacer
+          path: |
+            FramePacer.asi
+            FramePacer.ini
