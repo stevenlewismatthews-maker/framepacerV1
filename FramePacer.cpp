@@ -41,7 +41,7 @@ namespace {
 
 constexpr uintptr_t kCTimerUpdate = 0x561B10;  // CTimer::Update (GTA:SA 1.0 US)
 constexpr uintptr_t kExpectedBase = 0x400000;
-constexpr size_t    kMaxSites     = 4;         // sanity limit on call sites
+constexpr size_t    kMaxSites     = 32;        // sanity limit on call sites (real exe has ~11)
 
 constexpr int kWindow     = 240;  // frames of history used by Auto mode
 constexpr int kEvalEvery  = 30;   // re-evaluate every N frames
@@ -300,11 +300,11 @@ void Init(HMODULE self) {
     if (!g_timer) g_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
     if (g_cfg.mode == 1)
-        Log("FramePacer v2 starting in AUTO mode. Start=%g ms, range %g-%g ms, headroom=%g ms, "
+        Log("FramePacer v2.1 starting in AUTO mode. Start=%g ms, range %g-%g ms, headroom=%g ms, "
             "epsilon=%g ms, spin=%g ms",
             g_curTargetMs, g_cfg.minMs, g_cfg.maxMs, g_cfg.headroomMs, g_cfg.epsilonMs, g_cfg.spinMs);
     else
-        Log("FramePacer v2 starting in FIXED mode. TargetFrameMs=%g epsilon=%g ms, spin=%g ms",
+        Log("FramePacer v2.1 starting in FIXED mode. TargetFrameMs=%g epsilon=%g ms, spin=%g ms",
             g_curTargetMs, g_cfg.epsilonMs, g_cfg.spinMs);
 
     if (InstallHook())
