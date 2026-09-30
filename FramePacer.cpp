@@ -1,4 +1,4 @@
-// FramePacer.cpp
+// FramePacer.cpp  (v2: adds Auto mode)
 //
 // Paces frames immediately before GTA:SA's CTimer::Update samples its clock.
 // Target: GTA:SA 1.0 US (Hoodlum) exe only (the version SA-MP requires).
@@ -9,6 +9,11 @@
 // 240+ FPS the game sees a random mix of e.g. 4 and 5 ms ticks -> aim/strafe
 // jitter. This plugin waits right before the clock is sampled, so the delta the
 // game sees is stable. Approach based on MTA:SA PR #5417 (mtasa-blue).
+//
+// A fixed frame time only helps where your PC can actually finish a frame in that
+// time. Auto mode measures how long your frames really take and picks the
+// smallest WHOLE-millisecond frame time your PC can hold (e.g. 2, 3, 4 or 5 ms),
+// moving between them slowly so the target itself doesn't flicker.
 //
 // How it hooks: it does NOT patch the function itself. It scans the exe's
 // executable sections for CALL instructions that target CTimer::Update
@@ -22,11 +27,13 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <intrin.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 
 #pragma comment(lib, "winmm.lib")
 
@@ -36,12 +43,22 @@ constexpr uintptr_t kCTimerUpdate = 0x561B10;  // CTimer::Update (GTA:SA 1.0 US)
 constexpr uintptr_t kExpectedBase = 0x400000;
 constexpr size_t    kMaxSites     = 4;         // sanity limit on call sites
 
+constexpr int kWindow     = 240;  // frames of history used by Auto mode
+constexpr int kEvalEvery  = 30;   // re-evaluate every N frames
+constexpr int kRaiseEvals = 2;    // consecutive evaluations needed to slow the target down
+constexpr int kLowerEvals = 6;    // consecutive evaluations needed to speed the target up
+constexpr int kMaxLoggedChanges = 200;
+
 struct Config {
-    bool   enabled   = true;
-    double targetMs  = 4.0;   // frame time to enforce (integer ms recommended)
-    double epsilonMs = 0.02;  // tiny safety margin so the game never sees N-1 ms
-    double spinMs    = 1.5;   // final stretch is busy-waited for accuracy
-    bool   log       = true;
+    bool   enabled    = true;
+    int    mode       = 1;      // 0 = fixed TargetFrameMs, 1 = auto
+    double targetMs   = 4.0;    // fixed target (mode 0) / starting point (mode 1)
+    double minMs      = 2.0;    // auto: fastest frame time allowed
+    double maxMs      = 8.0;    // auto: slowest frame time allowed
+    double headroomMs = 0.15;   // auto: safety margin added to measured frame time
+    double epsilonMs  = 0.02;   // tiny safety margin so the game never sees N-1 ms
+    double spinMs     = 1.5;    // final stretch is busy-waited for accuracy
+    bool   log        = true;
 };
 
 Config        g_cfg;
@@ -51,6 +68,16 @@ bool          g_haveLast = false;
 HANDLE        g_timer    = nullptr;
 char          g_iniPath[MAX_PATH];
 char          g_logPath[MAX_PATH];
+
+// Active target frame time (ms) and Auto-mode state.
+double g_curTargetMs = 4.0;
+double g_samples[kWindow];
+int    g_sampleCount = 0;
+int    g_sampleIdx   = 0;
+int    g_sinceEval   = 0;
+int    g_candidate   = 0;
+int    g_candEvals   = 0;
+int    g_loggedChanges = 0;
 
 void Log(const char* fmt, ...) {
     if (!g_cfg.log) return;
@@ -72,13 +99,23 @@ double ReadDouble(const char* key, double def) {
 }
 
 double Clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+double RoundInt(double v) { return floor(v + 0.5); }
 
 void LoadConfig() {
-    g_cfg.enabled   = GetPrivateProfileIntA("FramePacer", "Enabled", 1, g_iniPath) != 0;
-    g_cfg.log       = GetPrivateProfileIntA("FramePacer", "Log", 1, g_iniPath) != 0;
-    g_cfg.targetMs  = Clamp(ReadDouble("TargetFrameMs", 4.0), 1.0, 33.0);
-    g_cfg.epsilonMs = Clamp(ReadDouble("EpsilonMs", 0.02), 0.0, 0.2);
-    g_cfg.spinMs    = Clamp(ReadDouble("SpinMs", 1.5), 0.2, 4.0);
+    g_cfg.enabled    = GetPrivateProfileIntA("FramePacer", "Enabled", 1, g_iniPath) != 0;
+    g_cfg.log        = GetPrivateProfileIntA("FramePacer", "Log", 1, g_iniPath) != 0;
+    g_cfg.mode       = GetPrivateProfileIntA("FramePacer", "Mode", 1, g_iniPath) != 0 ? 1 : 0;
+    g_cfg.targetMs   = Clamp(ReadDouble("TargetFrameMs", 4.0), 1.0, 33.0);
+    g_cfg.minMs      = RoundInt(Clamp(ReadDouble("MinFrameMs", 2.0), 1.0, 33.0));
+    g_cfg.maxMs      = RoundInt(Clamp(ReadDouble("MaxFrameMs", 8.0), 1.0, 33.0));
+    if (g_cfg.maxMs < g_cfg.minMs) g_cfg.maxMs = g_cfg.minMs;
+    g_cfg.headroomMs = Clamp(ReadDouble("HeadroomMs", 0.15), 0.0, 1.0);
+    g_cfg.epsilonMs  = Clamp(ReadDouble("EpsilonMs", 0.02), 0.0, 0.2);
+    g_cfg.spinMs     = Clamp(ReadDouble("SpinMs", 1.5), 0.2, 4.0);
+
+    g_curTargetMs = (g_cfg.mode == 1)
+                        ? Clamp(RoundInt(g_cfg.targetMs), g_cfg.minMs, g_cfg.maxMs)
+                        : g_cfg.targetMs;
 }
 
 // Sleep most of the wait with a (high-resolution if available) waitable timer.
@@ -94,13 +131,70 @@ void CoarseSleepMs(double ms) {
     Sleep(static_cast<DWORD>(ms));
 }
 
+// Auto mode: feed it how long the frame's own work took (ms, measured before we
+// wait). It keeps a window of recent frames, takes the ~95th percentile (so a
+// single hitch doesn't matter), adds a little headroom, rounds UP to a whole
+// millisecond, and only moves the active target after the answer has been stable
+// for several evaluations.
+void UpdateAuto(double naturalMs) {
+    if (naturalMs > 100.0) return;  // stalls / loading screens: ignore
+
+    g_samples[g_sampleIdx] = naturalMs;
+    g_sampleIdx = (g_sampleIdx + 1) % kWindow;
+    if (g_sampleCount < kWindow) ++g_sampleCount;
+
+    if (++g_sinceEval < kEvalEvery || g_sampleCount < kWindow / 2) return;
+    g_sinceEval = 0;
+
+    double tmp[kWindow];
+    memcpy(tmp, g_samples, sizeof(double) * static_cast<size_t>(g_sampleCount));
+    int k = static_cast<int>(g_sampleCount * 0.95);
+    if (k >= g_sampleCount) k = g_sampleCount - 1;
+    std::nth_element(tmp, tmp + k, tmp + g_sampleCount);
+    const double p95 = tmp[k];
+
+    const int desired = static_cast<int>(
+        Clamp(ceil(p95 + g_cfg.headroomMs), g_cfg.minMs, g_cfg.maxMs));
+    const int current = static_cast<int>(g_curTargetMs + 0.5);
+
+    if (desired == current) {
+        g_candidate = 0;
+        g_candEvals = 0;
+        return;
+    }
+    if (desired != g_candidate) {
+        g_candidate = desired;
+        g_candEvals = 1;
+    } else {
+        ++g_candEvals;
+    }
+
+    const int needed = (desired > current) ? kRaiseEvals : kLowerEvals;
+    if (g_candEvals >= needed) {
+        g_curTargetMs = static_cast<double>(desired);
+        g_candidate = 0;
+        g_candEvals = 0;
+        if (g_loggedChanges < kMaxLoggedChanges) {
+            ++g_loggedChanges;
+            Log("Auto: p95 frame work = %.2f ms -> target now %d ms (~%d FPS)", p95, desired,
+                1000 / desired);
+        }
+    }
+}
+
 // Replacement for calls to CTimer::Update. Waits, then calls the real function.
 void __cdecl PacedUpdate() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
     if (g_haveLast) {
-        const double periodMs = g_cfg.targetMs + g_cfg.epsilonMs;
+        if (g_cfg.mode == 1) {
+            const double naturalMs =
+                static_cast<double>(now.QuadPart - g_last.QuadPart) * 1000.0 / static_cast<double>(g_freq.QuadPart);
+            UpdateAuto(naturalMs);
+        }
+
+        const double periodMs = g_curTargetMs + g_cfg.epsilonMs;
         const LONGLONG target =
             g_last.QuadPart + static_cast<LONGLONG>(periodMs * static_cast<double>(g_freq.QuadPart) / 1000.0);
 
@@ -205,10 +299,16 @@ void Init(HMODULE self) {
     g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!g_timer) g_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
-    Log("FramePacer starting. TargetFrameMs=%g EpsilonMs=%g SpinMs=%g", g_cfg.targetMs, g_cfg.epsilonMs,
-        g_cfg.spinMs);
+    if (g_cfg.mode == 1)
+        Log("FramePacer v2 starting in AUTO mode. Start=%g ms, range %g-%g ms, headroom=%g ms, "
+            "epsilon=%g ms, spin=%g ms",
+            g_curTargetMs, g_cfg.minMs, g_cfg.maxMs, g_cfg.headroomMs, g_cfg.epsilonMs, g_cfg.spinMs);
+    else
+        Log("FramePacer v2 starting in FIXED mode. TargetFrameMs=%g epsilon=%g ms, spin=%g ms",
+            g_curTargetMs, g_cfg.epsilonMs, g_cfg.spinMs);
+
     if (InstallHook())
-        Log("Hook installed. Pacing at ~%.1f FPS.", 1000.0 / g_cfg.targetMs);
+        Log("Hook installed.");
 }
 
 }  // namespace
