@@ -42,6 +42,9 @@ namespace {
 constexpr uintptr_t kCTimerUpdate = 0x561B10;  // CTimer::Update (GTA:SA 1.0 US)
 constexpr uintptr_t kExpectedBase = 0x400000;
 constexpr size_t    kMaxSites     = 32;        // sanity limit on call sites (real exe has ~11)
+// CPad pad 0, NewState.RightShoulder1 (the on-foot aim/target button) = 0xB73458 + 0xC.
+// Read as a 2-byte value; > 0 means held. Verified at runtime via the "Aim pacing" log lines.
+constexpr uintptr_t kPad0AimButton = 0xB73464;
 
 constexpr int kWindow     = 240;  // frames of history used by Auto mode
 constexpr int kEvalEvery  = 30;   // re-evaluate every N frames
@@ -58,6 +61,8 @@ struct Config {
     double headroomMs = 0.15;   // auto: safety margin added to measured frame time
     double epsilonMs  = 0.02;   // tiny safety margin so the game never sees N-1 ms
     double spinMs     = 1.5;    // final stretch is busy-waited for accuracy
+    bool   onlyWhileAiming = false;  // pace only while the aim button is held
+    double aimHoldMs  = 250.0;  // keep pacing this long after aim is released
     bool   log        = true;
 };
 
@@ -78,6 +83,9 @@ int    g_sinceEval   = 0;
 int    g_candidate   = 0;
 int    g_candEvals   = 0;
 int    g_loggedChanges = 0;
+LONGLONG g_aimUntil   = 0;      // QPC time until which aim pacing stays active
+bool   g_lastActive  = false;
+int    g_loggedAim   = 0;
 
 void Log(const char* fmt, ...) {
     if (!g_cfg.log) return;
@@ -112,6 +120,8 @@ void LoadConfig() {
     g_cfg.headroomMs = Clamp(ReadDouble("HeadroomMs", 0.15), 0.0, 1.0);
     g_cfg.epsilonMs  = Clamp(ReadDouble("EpsilonMs", 0.02), 0.0, 0.2);
     g_cfg.spinMs     = Clamp(ReadDouble("SpinMs", 1.5), 0.2, 4.0);
+    g_cfg.onlyWhileAiming = GetPrivateProfileIntA("FramePacer", "OnlyWhileAiming", 0, g_iniPath) != 0;
+    g_cfg.aimHoldMs  = Clamp(ReadDouble("AimHoldMs", 250.0), 0.0, 5000.0);
 
     g_curTargetMs = (g_cfg.mode == 1)
                         ? Clamp(RoundInt(g_cfg.targetMs), g_cfg.minMs, g_cfg.maxMs)
@@ -182,6 +192,11 @@ void UpdateAuto(double naturalMs) {
     }
 }
 
+bool IsAiming() {
+    const short v = *reinterpret_cast<const volatile short*>(kPad0AimButton);
+    return v > 0;
+}
+
 // Replacement for calls to CTimer::Update. Waits, then calls the real function.
 void __cdecl PacedUpdate() {
     LARGE_INTEGER now;
@@ -194,11 +209,27 @@ void __cdecl PacedUpdate() {
             UpdateAuto(naturalMs);
         }
 
+        // Decide whether to pace this frame. Auto mode keeps measuring either way.
+        bool active = true;
+        if (g_cfg.onlyWhileAiming) {
+            if (IsAiming())
+                g_aimUntil = now.QuadPart + static_cast<LONGLONG>(g_cfg.aimHoldMs *
+                                                                 static_cast<double>(g_freq.QuadPart) / 1000.0);
+            active = now.QuadPart < g_aimUntil;
+            if (active != g_lastActive) {
+                g_lastActive = active;
+                if (g_loggedAim < 40) {
+                    ++g_loggedAim;
+                    Log("Aim pacing %s", active ? "ON" : "OFF");
+                }
+            }
+        }
+
         const double periodMs = g_curTargetMs + g_cfg.epsilonMs;
         const LONGLONG target =
             g_last.QuadPart + static_cast<LONGLONG>(periodMs * static_cast<double>(g_freq.QuadPart) / 1000.0);
 
-        if (now.QuadPart < target) {
+        if (active && now.QuadPart < target) {
             const double remainMs =
                 static_cast<double>(target - now.QuadPart) * 1000.0 / static_cast<double>(g_freq.QuadPart);
             const double coarseMs = remainMs - g_cfg.spinMs;
@@ -300,13 +331,15 @@ void Init(HMODULE self) {
     if (!g_timer) g_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
     if (g_cfg.mode == 1)
-        Log("FramePacer v2.1 starting in AUTO mode. Start=%g ms, range %g-%g ms, headroom=%g ms, "
+        Log("FramePacer v2.2 starting in AUTO mode. Start=%g ms, range %g-%g ms, headroom=%g ms, "
             "epsilon=%g ms, spin=%g ms",
             g_curTargetMs, g_cfg.minMs, g_cfg.maxMs, g_cfg.headroomMs, g_cfg.epsilonMs, g_cfg.spinMs);
     else
-        Log("FramePacer v2.1 starting in FIXED mode. TargetFrameMs=%g epsilon=%g ms, spin=%g ms",
+        Log("FramePacer v2.2 starting in FIXED mode. TargetFrameMs=%g epsilon=%g ms, spin=%g ms",
             g_curTargetMs, g_cfg.epsilonMs, g_cfg.spinMs);
 
+    if (g_cfg.onlyWhileAiming)
+        Log("OnlyWhileAiming=1: pacing only while aiming (hold %g ms after release).", g_cfg.aimHoldMs);
     if (InstallHook())
         Log("Hook installed.");
 }
